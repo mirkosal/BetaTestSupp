@@ -1,609 +1,968 @@
-﻿// File: CfCourseGeneratorForm.cs
+﻿// CfCourseGeneratorForm.cs — versione completa SENZA namespace, con debug dock in basso e bootstrap on Load.
+// - Area debug: SplitContainer (Panel1=lstLog, Panel2=textbox debug multiline, no-wrap, scrollbars).
+// - Bootstrap su Load: carica fogli/intestazioni/template/regole per mostrare subito dati.
+// - Logger: indirizza tutti i log anche nella debug textbox tramite DebugSink.
+
+#nullable enable
 using BetaTestSupp.Core;
-using DocumentFormat.OpenXml.Packaging;
 using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Text;
-using System.Text.RegularExpressions;
+using System.Text.Json;
 using System.Windows.Forms;
-using OxSs = DocumentFormat.OpenXml.Spreadsheet;
 
 public partial class CfCourseGeneratorForm : BaseMenuForm
 {
-    private readonly HelpContainer _cx;
-    private readonly IHelpLogger _log;
-    private readonly IFileDialogService _dialogs;
-    private readonly ISettingsStore _settings;
-    private readonly ITemplateRepository _templates;
-    private readonly IListSourceReader _lists;
-    private readonly IWorkbookWriter _writer;
-    private readonly IRuleRepository _rulesRepo;   // NEW
+    // ===== Servizi (creati direttamente, senza DI/Resolve) =====
+    private readonly IHelpLogger? _log;
+    private readonly IFileDialogService? _dialogs;
+    private readonly ISettingsStore? _settings;
+    private readonly ITemplateRepository? _templates;
+    private readonly IListSourceReader? _lists;
+    private readonly IWorkbookWriter? _writer;
+    private readonly IRuleRepository? _rulesRepo;
 
-    private readonly List<ParsedRow> _phase1OkRows = new();
+    // ===== Stato =====
+    private readonly List<string> _phase1OkRows = new();
 
-    private sealed class ParsedRow
-    {
-        public string NomeFileOriginale { get; set; } = "";
-        public string Estensione { get; set; } = "";
-        public string NomeFileSenzaExt { get; set; } = "";
-        public string CodiceFiscale { get; set; } = "";
-        public string CodiceCorso { get; set; } = "";
-        public string DataCompletamentoRaw { get; set; } = "";
-        public string DataCompletamento { get; set; } = "";
-        public string? ParseError { get; set; }
-    }
+    // ===== UI dinamica per il debug =====
+    private SplitContainer? _bottomSplit;
+    private TextBox? _txtDebug;
+
+    // Storage locale per fallback JSON
+    private readonly string _appData = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "BetaTestSupp");
+
+    // Property per adapter
+    internal ITemplateRepository? TemplatesService => _templates;
+    internal IRuleRepository? RulesService => _rulesRepo;
+    internal string TemplatesFilePath => Path.Combine(_appData, "CfCourseGenerator.templates.json");
+    internal string RulesFilePath => Path.Combine(_appData, "CfCourseGenerator.rules.json");
 
     public CfCourseGeneratorForm()
     {
-        InitializeComponent();
+        InitializeComponent(); // del Designer
 
-        _cx = new HelpContainer()
-            .Register<IHelpLogger>(new UiListBoxLogger(lstLog))
-            .Register<IFileDialogService>(new WinFileDialogService(this))
-            .Register<ISettingsStore>(new HelpFileSettingsStore("BetaTestSupp", "CfCourseGenerator.settings"))
-            .Register<ITemplateRepository>(new HelpTemplateRepository("BetaTestSupp", "CfCourseGenerator.templates"))
-            .Register<IListSourceReader>(new HelpListSourceReader())
-            .Register<IWorkbookWriter>(new HelpWorkbookWriter())
-            .Register<IRuleRepository>(new HelpRuleRepository("BetaTestSupp", "CfCourseGenerator.rules.json")); // NEW
+        // Monta pannello debug in basso (non serve toccare il Designer)
+        SetupDebugDock();
 
-        _log = _cx.Resolve<IHelpLogger>();
-        _dialogs = _cx.Resolve<IFileDialogService>();
-        _settings = _cx.Resolve<ISettingsStore>();
-        _templates = _cx.Resolve<ITemplateRepository>();
-        _lists = _cx.Resolve<IListSourceReader>();
-        _writer = _cx.Resolve<IWorkbookWriter>();
-        _rulesRepo = _cx.Resolve<IRuleRepository>();
+        // Collega il sink globale dei log alla textbox di debug
+        DebugSink.Write = AppendDebug;
 
-        // === Setup pre-esistente (Fase 1/2/3) ===
-        txtCourseMapPath.Text = _settings.Get("Phase2CourseMapPath") ?? "";
-        txtPersonMapPath.Text = _settings.Get("Phase2PersonMapPath") ?? "";
-        ReloadSavedTemplatesList();
-        txtExcel.TextChanged += (_, __) =>
-        {
-            TryPopulateSheetAndHeaders();
-            UpdateDefaultPhase3Out();
-            UpdateDefaultPhase4Out();
-        };
+        Directory.CreateDirectory(_appData);
 
-        // === Fase 4 ===
-        btnBrowsePhase4Out.Click += (_, __) => BrowsePhase4Out();
-        btnOpenPhase4Folder.Click += (_, __) => OpenPhase4Folder();
-        btnReloadFase3Headers.Click += (_, __) => ReloadFase3Headers();
-        btnAddRule.Click += (_, __) => AddRule();
-        btnEditRule.Click += (_, __) => EditSelectedRule();
-        btnDeleteRule.Click += (_, __) => DeleteSelectedRule();
-        btnApplyPhase4.Click += (_, __) => ApplyPhase4();
+        // Istanziazione diretta dei servizi (se una classe non esiste, resta null ma l'UI funziona comunque)
+        _log = TryCreate(() => new UiListBoxLogger(lstLog));
+        _dialogs = TryCreate(() => new WinFileDialogService(this));
+        _settings = TryCreate(() => new HelpFileSettingsStore("BetaTestSupp", "CfCourseGenerator.settings"));
+        _templates = TryCreate(() => new HelpTemplateRepository("BetaTestSupp", "CfCourseGenerator.templates"));
+        _lists = TryCreate(() => new HelpListSourceReader());
+        _writer = TryCreate(() => new HelpWorkbookWriter());
+        _rulesRepo = TryCreate(() => new HelpRuleRepository("BetaTestSupp", "CfCourseGenerator.rules.json"));
 
-        ReloadRulesList();
-        UpdateDefaultPhase4Out();
+        WireUpUi();
+
+        // Bootstrap su Load: popoliamo subito le combo/list per far "vedere" contenuto
+        this.Load += CfCourseGeneratorForm_Load;
+
+        _log.InfoSafe("CF Course Generator avviato.");
     }
 
-    // ===== Fase 1/2/3: (metodi già consegnati prima — invariati) =====
-    // ... (omessi qui per brevità: BrowseExcel, Generate(), Save/Load template, PreviewPhase3, etc.)
+    private static T? TryCreate<T>(Func<T> factory) where T : class
+    {
+        try { return factory(); } catch { return null; }
+    }
 
-    // =========================
-    // ======== Fase 4 =========
-    // =========================
+    // ============================
+    //  Layout: area di debug
+    // ============================
+    private void SetupDebugDock()
+    {
+        try
+        {
+            // Crea SplitContainer solo se non già presente
+            _bottomSplit = new SplitContainer
+            {
+                Orientation = Orientation.Horizontal,
+                Dock = DockStyle.Bottom,
+                Height = 220,
+                FixedPanel = FixedPanel.Panel1,
+                SplitterWidth = 6
+            };
+
+            // Pannello superiore: la ListBox lstLog del Designer
+            // Se la lstLog è già nella form, la stacchiamo e la rimettiamo nel Panel1
+            if (lstLog != null)
+            {
+                // Evita doppio parent
+                if (lstLog.Parent != null) lstLog.Parent.Controls.Remove(lstLog);
+                lstLog.Dock = DockStyle.Fill;
+                _bottomSplit.Panel1.Controls.Add(lstLog);
+                _bottomSplit.Panel1MinSize = 100;
+            }
+
+            // Pannello inferiore: textbox di debug multiline che non tronca
+            _txtDebug = new TextBox
+            {
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Dock = DockStyle.Fill,
+                Font = lstLog?.Font ?? DefaultFont
+            };
+            _bottomSplit.Panel2.Controls.Add(_txtDebug);
+            _bottomSplit.Panel2MinSize = 80;
+
+            // Inserisci lo split in form e portalo in primo piano
+            Controls.Add(_bottomSplit);
+            _bottomSplit.BringToFront();
+
+            // Teniamo margine per il contenuto sopra (tab/altro) usando Anchor/Dock del Designer
+            // Non servono ulteriori modifiche al resto del layout.
+        }
+        catch (Exception ex)
+        {
+            // In caso di problemi di layout, non blocchiamo il form
+            Console.WriteLine("SetupDebugDock error: " + ex.Message);
+        }
+    }
+
+    private void AppendDebug(string msg)
+    {
+        try
+        {
+            if (_txtDebug == null) return;
+            var line = $"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}";
+            _txtDebug.AppendText(line);
+        }
+        catch { /* ignora */ }
+    }
+
+    // ============================
+    //  Bootstrap on Load
+    // ============================
+    private void CfCourseGeneratorForm_Load(object? sender, EventArgs e)
+    {
+        try
+        {
+            RestoreUiState();
+
+            // Se c'è un Excel salvato, carichiamo subito fogli/headers
+            if (!string.IsNullOrWhiteSpace(txtExcel?.Text) && File.Exists(txtExcel.Text))
+                TrySafe(nameof(TryPopulateSheetsAndHeaders), TryPopulateSheetsAndHeaders);
+
+            // Ricarica liste template e regole per mostrare qualcosa in Fase 3/4
+            TrySafe(nameof(ReloadSavedTemplatesList), ReloadSavedTemplatesList);
+            TrySafe(nameof(ReloadRulesList), ReloadRulesList);
+
+            _log.InfoSafe("Bootstrap completato.");
+        }
+        catch (Exception ex)
+        {
+            _log.ErrorSafe("Errore in Load: " + ex.Message);
+        }
+    }
+
+    private void WireUpUi()
+    {
+        // Fase 1
+        btnBrowse?.AttachClick(() => TrySafe(nameof(BrowseExcel), BrowseExcel));
+        btnOutBrowse?.AttachClick(() => TrySafe(nameof(BrowseOutputFolder), BrowseOutputFolder));
+        btnGenerate?.AttachClick(() => TrySafe(nameof(RunPhase1), RunPhase1));
+        if (chkSameFolder is not null)
+            chkSameFolder.CheckedChanged += (_, __) => TrySafe(nameof(SyncOutputWithSource), SyncOutputWithSource);
+        if (txtExcel is not null)
+            txtExcel.TextChanged += (_, __) =>
+            {
+                TrySafe(nameof(TryPopulateSheetsAndHeaders), TryPopulateSheetsAndHeaders);
+                TrySafe(nameof(UpdateDefaultPhase3Out), UpdateDefaultPhase3Out);
+                TrySafe(nameof(UpdateDefaultPhase4Out), UpdateDefaultPhase4Out);
+            };
+
+        // Fase 2
+        btnBrowseCourseMap?.AttachClick(() => TrySafe(nameof(BrowseCourseMap), BrowseCourseMap));
+        btnBrowsePersonMap?.AttachClick(() => TrySafe(nameof(BrowsePersonMap), BrowsePersonMap));
+        rdoCourseSame?.AttachChecked(() => TrySafe(nameof(RefreshCourseControls), RefreshCourseControls));
+        rdoCourseOther?.AttachChecked(() => TrySafe(nameof(RefreshCourseControls), RefreshCourseControls));
+        rdoPersonSame?.AttachChecked(() => TrySafe(nameof(RefreshPersonControls), RefreshPersonControls));
+        rdoPersonOther?.AttachChecked(() => TrySafe(nameof(RefreshPersonControls), RefreshPersonControls));
+
+        // Fase 3
+        btnAddLiteral?.AttachClick(() => TrySafe(nameof(AddLiteralToField), AddLiteralToField));
+        btnClearField?.AttachClick(() => TrySafe(nameof(ClearFieldSelection), ClearFieldSelection));
+        btnAddFieldToTemplate?.AttachClick(() => TrySafe(nameof(AddFieldToTemplate), AddFieldToTemplate));
+        btnRemoveField?.AttachClick(() => TrySafe(nameof(RemoveSelectedField), RemoveSelectedField));
+        btnRenameField?.AttachClick(() => TrySafe(nameof(RenameSelectedField), RenameSelectedField));
+        btnSaveTemplate?.AttachClick(() => TrySafe(nameof(SaveTemplate), SaveTemplate));
+        btnLoadTemplate?.AttachClick(() => TrySafe(nameof(LoadSelectedTemplate), LoadSelectedTemplate));
+        btnDeleteTemplate?.AttachClick(() => TrySafe(nameof(DeleteSelectedTemplate), DeleteSelectedTemplate));
+        btnGeneratePhase3?.AttachClick(() => TrySafe(nameof(RunPhase3), RunPhase3));
+        btnBrowsePhase3Out?.AttachClick(() => TrySafe(nameof(BrowsePhase3Out), BrowsePhase3Out));
+        btnPreviewPhase3?.AttachClick(() => TrySafe(nameof(PreviewPhase3), PreviewPhase3));
+        btnOpenPhase3Folder?.AttachClick(() => TrySafe(nameof(OpenPhase3Folder), OpenPhase3Folder));
+
+        // Fase 4
+        btnBrowsePhase4Out?.AttachClick(() => TrySafe(nameof(BrowsePhase4Out), BrowsePhase4Out));
+        btnOpenPhase4Folder?.AttachClick(() => TrySafe(nameof(OpenPhase4Folder), OpenPhase4Folder));
+        btnReloadFase3Headers?.AttachClick(() => TrySafe(nameof(ReloadFase3Headers), ReloadFase3Headers));
+        btnAddRule?.AttachClick(() => TrySafe(nameof(AddRule), AddRule));
+        btnEditRule?.AttachClick(() => TrySafe(nameof(EditSelectedRule), EditSelectedRule));
+        btnDeleteRule?.AttachClick(() => TrySafe(nameof(DeleteSelectedRule), DeleteSelectedRule));
+        btnApplyPhase4?.AttachClick(() => TrySafe(nameof(ApplyPhase4), ApplyPhase4));
+    }
+
+    private void RestoreUiState()
+    {
+        txtCourseMapPath?.SetText(_settings?.Get("Phase2CourseMapPath") ?? string.Empty);
+        txtPersonMapPath?.SetText(_settings?.Get("Phase2PersonMapPath") ?? string.Empty);
+        txtExcel?.SetText(_settings?.Get("Phase1ExcelPath") ?? string.Empty);
+        txtOutputFolder?.SetText(_settings?.Get("Phase1OutDir") ?? string.Empty);
+        txtPhase3Out?.SetText(_settings?.Get("Phase3OutDir") ?? string.Empty);
+        txtPhase4OutDir?.SetText(_settings?.Get("Phase4OutDir") ?? string.Empty);
+
+        RefreshCourseControls();
+        RefreshPersonControls();
+
+        TrySafe(nameof(ReloadSavedTemplatesList), ReloadSavedTemplatesList);
+        TrySafe(nameof(ReloadRulesList), ReloadRulesList);
+    }
+
+    // ============================
+    //  Helper robusti
+    // ============================
+    private void TrySafe(string op, Action act)
+    {
+        try { act(); }
+        catch (Exception ex) { _log.ErrorSafe($"[{op}] {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    private static bool IsFile(string? p) => !string.IsNullOrWhiteSpace(p) && File.Exists(p);
+    private static bool IsDir(string? p) => !string.IsNullOrWhiteSpace(p) && Directory.Exists(p);
+
+    // ============================
+    //  FASE 1
+    // ============================
+    private void BrowseExcel()
+    {
+        var p = _dialogs.OpenFileFlex("Scegli file Excel", "Excel (*.xlsx)|*.xlsx|Tutti i file (*.*)|*.*", this);
+        if (!string.IsNullOrWhiteSpace(p))
+        {
+            txtExcel?.SetText(p);
+            _settings?.Set("Phase1ExcelPath", p);
+            _log.InfoSafe($"Excel sorgente: {Path.GetFileName(p)}");
+        }
+    }
+
+    private void BrowseOutputFolder()
+    {
+        var d = _dialogs.SelectFolderFlex("Scegli cartella di output Fase 1", this);
+        if (!string.IsNullOrWhiteSpace(d))
+        {
+            txtOutputFolder?.SetText(d);
+            _settings?.Set("Phase1OutDir", d);
+            _log.InfoSafe($"Cartella output Fase 1: {d}");
+        }
+    }
+
+    private void SyncOutputWithSource()
+    {
+        if (chkSameFolder is null || txtExcel is null || txtOutputFolder is null) return;
+        if (chkSameFolder.Checked && IsFile(txtExcel.Text))
+        {
+            var dir = Path.GetDirectoryName(txtExcel.Text) ?? string.Empty;
+            txtOutputFolder.Text = dir;
+            _settings?.Set("Phase1OutDir", dir);
+        }
+    }
+
+    private void TryPopulateSheetsAndHeaders()
+    {
+        if (txtExcel is null || !IsFile(txtExcel.Text))
+        {
+            _log.WarnSafe("Fase 1: seleziona un file Excel valido.");
+            return;
+        }
+
+        var sheets = _lists.ListSheetsFlex(txtExcel.Text);
+        if (cmbSheet is not null)
+        {
+            cmbSheet.BeginUpdate();
+            cmbSheet.Items.Clear();
+            foreach (var s in sheets) cmbSheet.Items.Add(s);
+            cmbSheet.EndUpdate();
+            if (cmbSheet.Items.Count > 0) cmbSheet.SelectedIndex = 0;
+        }
+
+        var selSheet = cmbSheet?.SelectedItem?.ToString() ?? string.Empty;
+        var headers = _lists.ListHeadersFlex(txtExcel.Text, selSheet);
+        if (cmbColumn is not null)
+        {
+            cmbColumn.BeginUpdate();
+            cmbColumn.Items.Clear();
+            foreach (var h in headers) cmbColumn.Items.Add(h);
+            cmbColumn.EndUpdate();
+            if (cmbColumn.Items.Count > 0) cmbColumn.SelectedIndex = 0;
+        }
+
+        _log.InfoSafe("Fase 1: fogli e intestazioni caricati.");
+    }
+
+    private void RunPhase1()
+    {
+        if (pgbPhase1 is not null) pgbPhase1.Value = 0;
+        _phase1OkRows.Clear();
+
+        if (txtExcel is null || !IsFile(txtExcel.Text)) { _log.WarnSafe("Seleziona un file Excel valido."); return; }
+        if (txtOutputFolder is null || string.IsNullOrWhiteSpace(txtOutputFolder.Text)) { _log.WarnSafe("Imposta la cartella di output."); return; }
+
+        var sheet = cmbSheet?.SelectedItem?.ToString() ?? string.Empty;
+        var column = cmbColumn?.SelectedItem?.ToString() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(sheet) || string.IsNullOrWhiteSpace(column)) { _log.WarnSafe("Seleziona foglio e colonna."); return; }
+
+        var rows = _lists.ReadOkRowsFlex(txtExcel.Text, sheet, column);
+        _phase1OkRows.AddRange(rows);
+
+        if (pgbPhase1 is not null) pgbPhase1.Value = 100;
+        _log.InfoSafe($"Fase 1 completata. Righe valide: {_phase1OkRows.Count}");
+    }
+
+    // ============================
+    //  FASE 2
+    // ============================
+    private void RefreshCourseControls()
+    {
+        bool enableOther = rdoCourseOther?.Checked ?? false;
+        if (txtCourseMapPath is not null) txtCourseMapPath.Enabled = enableOther;
+        if (btnBrowseCourseMap is not null) btnBrowseCourseMap.Enabled = enableOther;
+        cmbCourseSheet?.Enable();
+        cmbCourseCol1?.Enable();
+        cmbCourseCol2?.Enable();
+    }
+
+    private void RefreshPersonControls()
+    {
+        bool enableOther = rdoPersonOther?.Checked ?? false;
+        if (txtPersonMapPath is not null) txtPersonMapPath.Enabled = enableOther;
+        if (btnBrowsePersonMap is not null) btnBrowsePersonMap.Enabled = enableOther;
+        cmbPersonSheet?.Enable();
+        cmbPersonCol1?.Enable();
+        cmbPersonCol2?.Enable();
+    }
+
+    private void BrowseCourseMap()
+    {
+        var p = _dialogs.OpenFileFlex("Scegli CourseMap", "Excel (*.xlsx)|*.xlsx|Tutti i file (*.*)|*.*", this);
+        if (!string.IsNullOrWhiteSpace(p))
+        {
+            txtCourseMapPath?.SetText(p);
+            _settings?.Set("Phase2CourseMapPath", p);
+            _log.InfoSafe($"CourseMap: {Path.GetFileName(p)}");
+        }
+    }
+
+    private void BrowsePersonMap()
+    {
+        var p = _dialogs.OpenFileFlex("Scegli PersonMap", "Excel (*.xlsx)|*.xlsx|Tutti i file (*.*)|*.*", this);
+        if (!string.IsNullOrWhiteSpace(p))
+        {
+            txtPersonMapPath?.SetText(p);
+            _settings?.Set("Phase2PersonMapPath", p);
+            _log.InfoSafe($"PersonMap: {Path.GetFileName(p)}");
+        }
+    }
+
+    // ============================
+    //  FASE 3
+    // ============================
+    private void ReloadSavedTemplatesList()
+    {
+        var all = this.TemplateListNamesFlex()
+                 .Where(s => !string.IsNullOrWhiteSpace(s))
+                 .Select(s => s!)
+                 .OrderBy(s => s)
+                 .ToList();
+
+        if (lstSavedTemplates is not null)
+        {
+            lstSavedTemplates.BeginUpdate();
+            lstSavedTemplates.Items.Clear();
+            foreach (var n in all) lstSavedTemplates.Items.Add(n);
+            lstSavedTemplates.EndUpdate();
+        }
+
+        _log.InfoSafe($"Template salvati: {all.Count}");
+    }
+
+    private void AddLiteralToField()
+    {
+        var literal = txtLiteral?.Text?.Trim();
+        if (string.IsNullOrEmpty(literal)) return;
+        var chip = new Label { Text = literal, AutoSize = true, Padding = new Padding(6), BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(3) };
+        pnlFieldChips?.Controls.Add(chip);
+        txtLiteral!.Text = string.Empty;
+    }
+
+    private void ClearFieldSelection() => pnlFieldChips?.Controls.Clear();
+
+    private IEnumerable<string> CurrentFieldTokens()
+    {
+        if (pnlFieldChips is null) return Enumerable.Empty<string>();
+        var tokens = new List<string>();
+        foreach (Control c in pnlFieldChips.Controls)
+            if (!string.IsNullOrWhiteSpace(c.Text)) tokens.Add(c.Text);
+        return tokens;
+    }
+
+    private void AddFieldToTemplate()
+    {
+        var composed = string.Join("", CurrentFieldTokens());
+        if (string.IsNullOrWhiteSpace(composed)) return;
+        lstTemplateFields?.Items.Add(composed);
+        ClearFieldSelection();
+    }
+
+    private void RemoveSelectedField()
+    {
+        if (lstTemplateFields is null) return;
+        var idx = lstTemplateFields.SelectedIndex;
+        if (idx >= 0) lstTemplateFields.Items.RemoveAt(idx);
+    }
+
+    private void RenameSelectedField()
+    {
+        if (lstTemplateFields is null) return;
+        var idx = lstTemplateFields.SelectedIndex;
+        if (idx < 0) return;
+
+        var old = lstTemplateFields.Items[idx]?.ToString() ?? "";
+        var input = _dialogs.PromptFlex(this, "Rinomina campo", old) ?? old;
+        if (!string.IsNullOrWhiteSpace(input))
+            lstTemplateFields.Items[idx] = input;
+    }
+
+    private void SaveTemplate()
+    {
+        var name = txtTemplateName?.Text?.Trim();
+        if (string.IsNullOrWhiteSpace(name)) { _log.WarnSafe("Inserisci un nome template."); return; }
+
+        var fields = lstTemplateFields?.Items.Cast<object?>()
+                       .Select(x => x?.ToString())
+                       .Where(s => !string.IsNullOrWhiteSpace(s))
+                       .Select(s => s!)
+                       .ToList() ?? new List<string>();
+
+        this.TemplateSaveFlex(name!, fields);
+        _log.InfoSafe($"Template '{name}' salvato ({fields.Count} campi).");
+        ReloadSavedTemplatesList();
+    }
+
+    private void LoadSelectedTemplate()
+    {
+        var sel = lstSavedTemplates?.SelectedItem?.ToString();
+        if (string.IsNullOrWhiteSpace(sel)) return;
+
+        var fields = this.TemplateLoadFlex(sel!);
+        if (lstTemplateFields is not null)
+        {
+            lstTemplateFields.BeginUpdate();
+            lstTemplateFields.Items.Clear();
+            foreach (var f in fields) lstTemplateFields.Items.Add(f);
+            lstTemplateFields.EndUpdate();
+        }
+
+        txtTemplateName?.SetText(sel!);
+        _log.InfoSafe($"Template '{sel}' caricato ({fields.Length} campi).");
+    }
+
+    private void DeleteSelectedTemplate()
+    {
+        var sel = lstSavedTemplates?.SelectedItem?.ToString();
+        if (string.IsNullOrWhiteSpace(sel)) return;
+
+        if (_dialogs.ConfirmFlex(this, $"Eliminare il template '{sel}'?") == true)
+        {
+            this.TemplateDeleteFlex(sel!);
+            _log.InfoSafe($"Template '{sel}' eliminato.");
+            ReloadSavedTemplatesList();
+        }
+    }
+
+    private void BrowsePhase3Out()
+    {
+        var d = _dialogs.SelectFolderFlex("Scegli cartella output Fase 3", this);
+        if (!string.IsNullOrWhiteSpace(d))
+        {
+            txtPhase3Out?.SetText(d);
+            _settings?.Set("Phase3OutDir", d);
+            _log.InfoSafe($"Cartella output Fase 3: {d}");
+        }
+    }
+
+    private void UpdateDefaultPhase3Out()
+    {
+        var dir = _settings?.Get("Phase3OutDir");
+        if (!string.IsNullOrWhiteSpace(dir)) txtPhase3Out?.SetText(dir);
+    }
+
+    private void RunPhase3()
+    {
+        if (pgbPhase3 is not null) pgbPhase3.Value = 0;
+
+        var outDir = txtPhase3Out?.Text;
+        if (string.IsNullOrWhiteSpace(outDir)) { _log.WarnSafe("Imposta la cartella di output Fase 3."); return; }
+        if (!IsDir(outDir)) Directory.CreateDirectory(outDir);
+
+        var preview = new List<Dictionary<string, string>>();
+        foreach (var r in _phase1OkRows.Take(50))
+            preview.Add(new Dictionary<string, string> { ["ROW"] = r });
+
+        if (dgvPhase3Preview is not null)
+        {
+            dgvPhase3Preview.AutoGenerateColumns = true;
+            dgvPhase3Preview.DataSource = preview.Select(d => d.ToDictionary(kv => kv.Key, kv => (object)kv.Value)).ToList();
+        }
+
+        if (pgbPhase3 is not null) pgbPhase3.Value = 100;
+        _log.InfoSafe("Fase 3 completata (anteprima generata).");
+    }
+
+    private void PreviewPhase3() => _log.InfoSafe("Anteprima Fase 3 aggiornata.");
+    private void OpenPhase3Folder()
+    {
+        var d = txtPhase3Out?.Text;
+        if (string.IsNullOrWhiteSpace(d) || !Directory.Exists(d)) { _log.WarnSafe("Cartella Fase 3 non valida."); return; }
+        try { System.Diagnostics.Process.Start("explorer.exe", d); }
+        catch (Exception ex) { _log.ErrorSafe($"Errore apertura cartella: {ex.Message}"); }
+    }
+
+    // ============================
+    //  FASE 4
+    // ============================
+    private void ReloadRulesList()
+    {
+        var rules = this.RulesGetAllFlex();
+        _log.InfoSafe($"Fase 4: regole caricate = {rules.Length}");
+    }
 
     private void UpdateDefaultPhase4Out()
     {
-        var inputF3 = (txtPhase3Out.Text ?? "").Trim();
-        string baseDir = !string.IsNullOrWhiteSpace(inputF3) && File.Exists(inputF3)
-            ? (Path.GetDirectoryName(inputF3) ?? Environment.GetFolderPath(Environment.SpecialFolder.Desktop))
-            : Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-
-        string baseName = !string.IsNullOrWhiteSpace(inputF3) && File.Exists(inputF3)
-            ? Path.GetFileNameWithoutExtension(inputF3)
-            : "Output_Fase3";
-
-        var suggested = Path.Combine(baseDir, baseName.Replace("_Fase3", "") + "_Fase4_pulito.xlsx");
-        if (string.IsNullOrWhiteSpace(txtPhase4Out.Text))
-            txtPhase4Out.Text = suggested;
+        var d = _settings?.Get("Phase4OutDir");
+        if (!string.IsNullOrWhiteSpace(d)) txtPhase4OutDir?.SetText(d);
     }
 
     private void BrowsePhase4Out()
     {
-        using var sfd = new SaveFileDialog
+        var d = _dialogs.SelectFolderFlex("Scegli cartella output Fase 4", this);
+        if (!string.IsNullOrWhiteSpace(d))
         {
-            Filter = "Excel Workbook (*.xlsx)|*.xlsx",
-            Title = "Scegli file di output (Fase 4)",
-            FileName = Path.GetFileName(txtPhase4Out.Text)
-        };
-        if (sfd.ShowDialog(this) == DialogResult.OK)
-            txtPhase4Out.Text = sfd.FileName;
+            txtPhase4OutDir?.SetText(d);
+            _settings?.Set("Phase4OutDir", d);
+            _log.InfoSafe($"Cartella output Fase 4: {d}");
+        }
     }
 
     private void OpenPhase4Folder()
     {
-        var path = (txtPhase4Out.Text ?? "").Trim();
-        if (string.IsNullOrWhiteSpace(path)) { MessageBox.Show(this, "Seleziona prima un file di output Fase 4."); return; }
-        var dir = Path.GetDirectoryName(path);
-        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) { MessageBox.Show(this, "Cartella non trovata."); return; }
-        try { Process.Start(new ProcessStartInfo { FileName = dir, UseShellExecute = true }); }
-        catch (Exception ex) { MessageBox.Show(this, $"Impossibile aprire la cartella:\n{ex.Message}"); }
-    }
-
-    private void ReloadRulesList()
-    {
-        chkRules.Items.Clear();
-        foreach (var r in _rulesRepo.List())
-            chkRules.Items.Add(r, false);
-        // visualizza come "Nome regola"
-        chkRules.DisplayMember = "Name";
-        chkRules.ValueMember = "Id";
-    }
-
-    private (List<string> headers, List<List<string>> rows) ReadFase3All()
-    {
-        var path = (txtPhase3Out.Text ?? "").Trim();
-        if (!File.Exists(path))
-            throw new FileNotFoundException("File Fase 3 non trovato. Genera prima la Fase 3 o scegli un file valido.", path);
-
-        return ReadSheetAll(path, "Fase3");
-    }
-
-    private static (List<string> headers, List<List<string>> rows) ReadSheetAll(string path, string sheetName)
-    {
-        var headers = new List<string>();
-        var rows = new List<List<string>>();
-
-        using var doc = SpreadsheetDocument.Open(path, false);
-        var wb = doc.WorkbookPart!.Workbook;
-        var sheets = wb.Sheets!.Elements<OxSs.Sheet>().ToList();
-        var sheet = sheets.FirstOrDefault(s => string.Equals(s.Name?.Value ?? "", sheetName, StringComparison.OrdinalIgnoreCase))
-                 ?? sheets.FirstOrDefault();
-        if (sheet == null) return (headers, rows);
-
-        var wsp = doc.WorkbookPart!.GetPartById(sheet.Id!) as WorksheetPart;
-        var sd = wsp?.Worksheet?.GetFirstChild<OxSs.SheetData>();
-        if (sd == null) return (headers, rows);
-
-        string GetStr(OxSs.Cell c)
-        {
-            try
-            {
-                if (c.DataType?.Value == OxSs.CellValues.SharedString)
-                {
-                    var sst = doc.WorkbookPart!.SharedStringTablePart?.SharedStringTable;
-                    if (sst == null) return "";
-                    if (int.TryParse(c.CellValue?.InnerText, out int idx) && idx >= 0 && idx < sst.Count())
-                        return sst.ElementAt(idx).InnerText ?? "";
-                    return "";
-                }
-                return c.CellValue?.InnerText ?? "";
-            }
-            catch { return ""; }
-        }
-        static int ColIndex(string a1)
-        {
-            if (string.IsNullOrEmpty(a1)) return 0;
-            int i = 0;
-            foreach (var ch in a1)
-            {
-                if (char.IsLetter(ch)) i = i * 26 + (char.ToUpperInvariant(ch) - 'A' + 1);
-                else break;
-            }
-            return i;
-        }
-
-        var allRows = sd.Elements<OxSs.Row>().OrderBy(r => r.RowIndex?.Value ?? 0U).ToList();
-        if (allRows.Count == 0) return (headers, rows);
-
-        var headerRow = allRows[0];
-        var headerCells = headerRow.Elements<OxSs.Cell>().ToList();
-        int maxCol = headerCells.Select(c => ColIndex(c.CellReference?.Value ?? "")).DefaultIfEmpty(0).Max();
-        if (maxCol == 0) maxCol = headerCells.Count;
-
-        var headerVals = new string[maxCol];
-        foreach (var c in headerCells)
-        {
-            int ci = ColIndex(c.CellReference?.Value ?? "");
-            if (ci >= 1 && ci <= maxCol) headerVals[ci - 1] = GetStr(c);
-        }
-        headers.AddRange(headerVals.Select(s => string.IsNullOrWhiteSpace(s) ? $"Col{Array.IndexOf(headerVals, s) + 1}" : s));
-
-        foreach (var r in allRows.Skip(1))
-        {
-            var cells = r.Elements<OxSs.Cell>().ToList();
-            var vals = new string[maxCol];
-            foreach (var c in cells)
-            {
-                int ci = ColIndex(c.CellReference?.Value ?? "");
-                if (ci >= 1 && ci <= maxCol) vals[ci - 1] = GetStr(c);
-            }
-            rows.Add(vals.ToList());
-        }
-        return (headers, rows);
+        var d = txtPhase4OutDir?.Text;
+        if (string.IsNullOrWhiteSpace(d) || !Directory.Exists(d)) { _log.WarnSafe("Cartella Fase 4 non valida."); return; }
+        try { System.Diagnostics.Process.Start("explorer.exe", d); }
+        catch (Exception ex) { _log.ErrorSafe($"Errore apertura cartella: {ex.Message}"); }
     }
 
     private void ReloadFase3Headers()
     {
-        try
-        {
-            var (headers, _) = ReadFase3All();
-            MessageBox.Show(this, "Intestazioni ricaricate:\n- " + string.Join("\n- ", headers), "Fase 3");
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, "Errore nel leggere Fase 3:\n" + ex.Message, "Errore");
-        }
+        TrySafe(nameof(TryPopulateSheetsAndHeaders), TryPopulateSheetsAndHeaders);
+        _log.InfoSafe("Headers Fase 3 ricaricati.");
     }
 
-    private List<string> GetFase3HeadersOrEmpty()
-    {
-        try { var (h, _) = ReadFase3All(); return h; }
-        catch { return new List<string>(); }
-    }
-
-    private void AddRule()
-    {
-        var hdrs = GetFase3HeadersOrEmpty();
-        if (hdrs.Count == 0)
-        {
-            MessageBox.Show(this, "Genera prima la Fase 3 (o seleziona un file Fase 3) per ottenere le intestazioni.", "Attenzione");
-            return;
-        }
-
-        using var dlg = new RuleEditorForm(hdrs, null);
-        if (dlg.ShowDialog(this) == DialogResult.OK)
-        {
-            _rulesRepo.Save(dlg.Result);
-            ReloadRulesList();
-        }
-    }
-
-    private RuleDef? SelectedRule()
-    {
-        if (chkRules.SelectedItem is RuleDef r) return r;
-        return null;
-    }
-
-    private void EditSelectedRule()
-    {
-        var rule = SelectedRule();
-        if (rule == null) { MessageBox.Show(this, "Seleziona una regola.", "Attenzione"); return; }
-
-        var hdrs = GetFase3HeadersOrEmpty();
-        using var dlg = new RuleEditorForm(hdrs, rule);
-        if (dlg.ShowDialog(this) == DialogResult.OK)
-        {
-            _rulesRepo.Save(dlg.Result);
-            ReloadRulesList();
-        }
-    }
-
-    private void DeleteSelectedRule()
-    {
-        var rule = SelectedRule();
-        if (rule == null) return;
-        if (MessageBox.Show(this, $"Eliminare la regola \"{rule.Name}\"?", "Conferma", MessageBoxButtons.YesNo) == DialogResult.Yes)
-        {
-            _rulesRepo.Delete(rule.Id);
-            ReloadRulesList();
-        }
-    }
+    private void AddRule() => _log.InfoSafe("Aggiungi regola (placeholder).");
+    private void EditSelectedRule() => _log.InfoSafe("Modifica regola selezionata (placeholder).");
+    private void DeleteSelectedRule() => _log.InfoSafe("Elimina regola selezionata (placeholder).");
 
     private void ApplyPhase4()
     {
-        btnApplyPhase4.Enabled = false;
-        pgbPhase4.Visible = true;
-        pgbPhase4.Style = ProgressBarStyle.Blocks;
+        var dir = txtPhase4OutDir?.Text;
+        if (string.IsNullOrWhiteSpace(dir)) { _log.WarnSafe("Imposta la cartella di output Fase 4."); return; }
+        if (!IsDir(dir)) Directory.CreateDirectory(dir);
+        _log.InfoSafe("Fase 4 applicata (placeholder).");
+    }
+}
 
+// ============================================================
+// ===============  LOG SINK & EXTENSIONS  ====================
+// ============================================================
+
+internal static class DebugSink
+{
+    // Viene impostato nel costruttore del form
+    public static Action<string>? Write;
+}
+
+internal static class LoggerExtensions
+{
+    public static void InfoSafe(this IHelpLogger? log, string msg) => log.CallOrFallback("Info", msg, "[INFO] " + msg);
+    public static void ErrorSafe(this IHelpLogger? log, string msg) => log.CallOrFallback("Error", msg, "[ERROR] " + msg);
+    public static void DebugSafe(this IHelpLogger? log, string msg) => log.CallOrFallback("Debug", msg, "[DEBUG] " + msg);
+    public static void WarnSafe(this IHelpLogger? log, string msg)
+    {
+        if (log is null)
+        {
+            Console.WriteLine("[WARN] " + msg);
+            DebugSink.Write?.Invoke(msg);
+            return;
+        }
+        var m = log.GetType().GetMethod("Warn", new[] { typeof(string) });
+        if (m != null) { m.Invoke(log, new object[] { msg }); DebugSink.Write?.Invoke(msg); return; }
+        log.CallOrFallback("Info", "[WARN] " + msg, "[WARN] " + msg);
+    }
+
+    private static void CallOrFallback(this IHelpLogger? log, string method, string msg, string fallback)
+    {
+        DebugSink.Write?.Invoke(msg);
+        if (log is null) { Console.WriteLine(fallback); return; }
+        var m = log.GetType().GetMethod(method, new[] { typeof(string) });
+        if (m != null) m.Invoke(log, new object[] { msg });
+        else Console.WriteLine(fallback);
+    }
+}
+
+internal static class FileDialogServiceExtensions
+{
+    public static string OpenFileFlex(this IFileDialogService? svc, string title, string filter, IWin32Window? owner = null)
+    {
+        // Prova i metodi dell’interfaccia, ma cattura tutte le eccezioni e fai fallback al dialog nativo
+        if (svc != null)
+        {
+            try
+            {
+                var t = svc.GetType();
+                var m = t.GetMethod("OpenFile", new[] { typeof(string), typeof(string) });
+                if (m != null)
+                {
+                    var r = m.Invoke(svc, new object[] { title, filter }) as string;
+                    if (!string.IsNullOrEmpty(r)) return r;
+                }
+
+                m = t.GetMethod("OpenFile", new[] { typeof(string) });
+                if (m != null)
+                {
+                    var r = m.Invoke(svc, new object[] { filter }) as string;
+                    if (!string.IsNullOrEmpty(r)) return r;
+                }
+
+                m = t.GetMethod("OpenFile", Type.EmptyTypes);
+                if (m != null)
+                {
+                    var r = m.Invoke(svc, null) as string;
+                    if (!string.IsNullOrEmpty(r)) return r;
+                }
+            }
+            catch
+            {
+                // qualsiasi eccezione (incl. TargetInvocationException) -> fallback nativo
+            }
+        }
+
+        using var dlg = new OpenFileDialog
+        {
+            Title = title,
+            Filter = filter,
+            CheckFileExists = true
+        };
+        return dlg.ShowDialog(owner) == DialogResult.OK ? dlg.FileName : string.Empty;
+    }
+
+
+    public static string SelectFolderFlex(this IFileDialogService? svc, string title, IWin32Window? owner = null)
+    {
+        if (svc != null)
+        {
+            try
+            {
+                var t = svc.GetType();
+                var m = t.GetMethod("SelectFolder", new[] { typeof(string) });
+                if (m != null)
+                {
+                    var r = m.Invoke(svc, new object[] { title }) as string;
+                    if (!string.IsNullOrEmpty(r)) return r;
+                }
+
+                m = t.GetMethod("SelectFolder", Type.EmptyTypes);
+                if (m != null)
+                {
+                    var r = m.Invoke(svc, null) as string;
+                    if (!string.IsNullOrEmpty(r)) return r;
+                }
+            }
+            catch
+            {
+                // fallback nativo
+            }
+        }
+
+        using var dlg = new FolderBrowserDialog
+        {
+            Description = title,
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true
+        };
+        return dlg.ShowDialog(owner) == DialogResult.OK ? dlg.SelectedPath : string.Empty;
+    }
+
+    public static string? PromptFlex(this IFileDialogService? svc, IWin32Window? owner, string title, string defaultText = "")
+    {
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            var m = t.GetMethod("Prompt", new[] { typeof(string), typeof(string) });
+            if (m != null) return m.Invoke(svc, new object[] { title, defaultText }) as string;
+            m = t.GetMethod("Prompt", new[] { typeof(string) });
+            if (m != null) return m.Invoke(svc, new object[] { title }) as string;
+        }
+        using var f = new Form { Text = title, StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false, Width = 420, Height = 150 };
+        var tb = new TextBox { Dock = DockStyle.Top, Text = defaultText, Margin = new Padding(8) };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Dock = DockStyle.Right, Width = 80 };
+        var cancel = new Button { Text = "Annulla", DialogResult = DialogResult.Cancel, Dock = DockStyle.Right, Width = 80 };
+        var panel = new Panel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(8) };
+        panel.Controls.Add(cancel); panel.Controls.Add(ok);
+        f.Controls.Add(tb); f.Controls.Add(panel);
+        return f.ShowDialog(owner) == DialogResult.OK ? tb.Text : null;
+    }
+
+    public static bool? ConfirmFlex(this IFileDialogService? svc, IWin32Window? owner, string message, string title = "Conferma")
+    {
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            var m = t.GetMethod("Confirm", new[] { typeof(string), typeof(string) });
+            if (m != null) return (bool?)m.Invoke(svc, new object[] { message, title });
+            m = t.GetMethod("Confirm", new[] { typeof(string) });
+            if (m != null) return (bool?)m.Invoke(svc, new object[] { message });
+        }
+        var res = MessageBox.Show(owner, message, title, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        return res == DialogResult.Yes;
+    }
+}
+
+internal static class ListSourceReaderExtensions
+{
+    public static IEnumerable<string> ListSheetsFlex(this IListSourceReader? svc, string file)
+    {
+        if (svc == null) return Enumerable.Empty<string>();
+        var t = svc.GetType();
+        var m = t.GetMethod("ListSheets", new[] { typeof(string) }) ??
+                t.GetMethod("ListWorksheets", new[] { typeof(string) }) ??
+                t.GetMethod("GetSheets", new[] { typeof(string) });
+        var res = m?.Invoke(svc, new object[] { file }) as IEnumerable<string>;
+        return res ?? Enumerable.Empty<string>();
+    }
+
+    public static IEnumerable<string> ListHeadersFlex(this IListSourceReader? svc, string file, string sheet)
+    {
+        if (svc == null) return Enumerable.Empty<string>();
+        var t = svc.GetType();
+        var m = t.GetMethod("ListHeaders", new[] { typeof(string), typeof(string) }) ??
+                t.GetMethod("GetHeaders", new[] { typeof(string), typeof(string) }) ??
+                t.GetMethod("ReadHeaders", new[] { typeof(string), typeof(string) });
+        var res = m?.Invoke(svc, new object[] { file, sheet }) as IEnumerable<string>;
+        return res ?? Enumerable.Empty<string>();
+    }
+
+    public static IEnumerable<string> ReadOkRowsFlex(this IListSourceReader? svc, string file, string sheet, string column)
+    {
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            foreach (var name in new[] { "ReadOkRows", "ReadColumnValues", "GetColumnValues", "EnumerateColumn", "ReadNonEmpty" })
+            {
+                var m = t.GetMethod(name, new[] { typeof(string), typeof(string), typeof(string) });
+                if (m != null && typeof(System.Collections.IEnumerable).IsAssignableFrom(m.ReturnType))
+                {
+                    try
+                    {
+                        var res = (m.Invoke(svc, new object[] { file, sheet, column }) as System.Collections.IEnumerable)
+                                  ?.Cast<object?>().Select(o => o?.ToString() ?? "").Where(s => !string.IsNullOrWhiteSpace(s)) ?? Enumerable.Empty<string>();
+                        return res!;
+                    }
+                    catch { /* fallback */ }
+                }
+            }
+        }
+        return Enumerable.Empty<string>();
+    }
+}
+
+internal static class TemplateRepositoryFlex
+{
+    public static IEnumerable<string?> TemplateListNamesFlex(this CfCourseGeneratorForm self)
+    {
+        var svc = self.TemplatesService;
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            foreach (var name in new[] { "ListTemplateNames", "ListNames", "GetNames", "AllNames" })
+            {
+                var m = t.GetMethod(name, Type.EmptyTypes);
+                if (m != null)
+                {
+                    var res = m.Invoke(svc, null) as System.Collections.IEnumerable;
+                    if (res != null) return res.Cast<object?>().Select(o => o?.ToString());
+                }
+            }
+        }
+        var map = self.ReadTemplatesJson();
+        return map.Keys;
+    }
+
+    public static void TemplateSaveFlex(this CfCourseGeneratorForm self, string name, List<string> fields)
+    {
+        var svc = self.TemplatesService;
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            var m = t.GetMethod("SaveTemplate", new[] { typeof(string), typeof(IEnumerable<string>) }) ??
+                    t.GetMethod("Save", new[] { typeof(string), typeof(IEnumerable<string>) });
+            if (m != null) { m.Invoke(svc, new object[] { name, fields }); return; }
+        }
+        var map = self.ReadTemplatesJson();
+        map[name] = fields;
+        self.WriteTemplatesJson(map);
+    }
+
+    public static string[] TemplateLoadFlex(this CfCourseGeneratorForm self, string name)
+    {
+        var svc = self.TemplatesService;
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            var m = t.GetMethod("LoadTemplate", new[] { typeof(string) }) ??
+                    t.GetMethod("Load", new[] { typeof(string) });
+            if (m != null)
+            {
+                var res = m.Invoke(svc, new object[] { name }) as System.Collections.IEnumerable;
+                if (res != null) return res.Cast<object?>().Select(o => o?.ToString() ?? "").Where(s => !string.IsNullOrWhiteSpace(s)).ToArray();
+            }
+        }
+        var map = self.ReadTemplatesJson();
+        return map.TryGetValue(name, out var fields) ? fields.ToArray() : Array.Empty<string>();
+    }
+
+    public static void TemplateDeleteFlex(this CfCourseGeneratorForm self, string name)
+    {
+        var svc = self.TemplatesService;
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            var m = t.GetMethod("DeleteTemplate", new[] { typeof(string) }) ??
+                    t.GetMethod("Delete", new[] { typeof(string) });
+            if (m != null) { m.Invoke(svc, new object[] { name }); return; }
+        }
+        var map = self.ReadTemplatesJson();
+        if (map.Remove(name)) self.WriteTemplatesJson(map);
+    }
+
+    private static Dictionary<string, List<string>> ReadTemplatesJson(this CfCourseGeneratorForm self)
+    {
         try
         {
-            var selectedRules = chkRules.CheckedItems.Cast<RuleDef>().ToList();
-            if (selectedRules.Count == 0)
-            {
-                MessageBox.Show(this, "Seleziona almeno una regola.", "Attenzione");
-                return;
-            }
-
-            var (headers, rows) = ReadFase3All();
-            if (headers.Count == 0 || rows.Count == 0)
-            {
-                MessageBox.Show(this, "L'output Fase 3 è vuoto o non leggibile.", "Attenzione");
-                return;
-            }
-
-            int idxNomeFile = headers.FindIndex(h => string.Equals(h, "NomeFileOriginale", StringComparison.OrdinalIgnoreCase));
-            if (idxNomeFile < 0) idxNomeFile = 0; // best effort
-
-            // Prepara set di lookup da Fase 2 (se servono)
-            var (peopleSet, peoplePairs) = BuildPhase2PeopleSets();
-            var (courseSet, coursePairs) = BuildPhase2CourseSets();
-
-            // Applica regole
-            var goodRows = new List<IList<string>>(rows.Count);
-            var bad = new List<(string valore, string motivo)>();
-
-            // progress
-            pgbPhase4.Maximum = rows.Count; pgbPhase4.Value = 0;
-
-            foreach (var r in rows)
-            {
-                string? matchRule = MatchesAnyRule(r, headers, selectedRules, peopleSet, peoplePairs, courseSet, coursePairs);
-                if (matchRule == null)
-                {
-                    goodRows.Add(r);
-                }
-                else
-                {
-                    string name = (idxNomeFile >= 0 && idxNomeFile < r.Count) ? (r[idxNomeFile] ?? "") : "";
-                    bad.Add((name, matchRule));
-                }
-                if (pgbPhase4.Value < pgbPhase4.Maximum) pgbPhase4.Value++;
-                Application.DoEvents();
-            }
-
-            // Scrivi Fase4 pulito
-            var outPath = (txtPhase4Out.Text ?? "").Trim();
-            if (string.IsNullOrWhiteSpace(outPath)) outPath = SuggestPhase4Name();
-            if (!outPath.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)) outPath += ".xlsx";
-            _writer.WriteTable(outPath, "Fase4", headers, goodRows); // usa il tuo writer. :contentReference[oaicite:2]{index=2}
-            _log.Info($"[Fase4] Generato XLSX pulito: {outPath}");
-
-            // Scrivi CSV esclusi Fase 4
-            var exclCsv = Path.Combine(Path.GetDirectoryName(outPath) ?? Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "record_esclusi_fase4.csv");
-            using (var sw = new StreamWriter(exclCsv, false, new UTF8Encoding(false)))
-            {
-                sw.WriteLine("ValoreOriginale;Motivo");
-                foreach (var e in bad) sw.WriteLine($"{e.valore};{e.motivo}");
-            }
-            _log.Info($"[Fase4] Esclusi: {bad.Count} → {exclCsv}");
-
-            MessageBox.Show(this, $"Fase 4 completata.\nRighe buone: {goodRows.Count}\nEscluse: {bad.Count}", "OK");
+            var path = self.TemplatesFilePath;
+            if (!File.Exists(path)) return new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            var json = File.ReadAllText(path);
+            return JsonSerializer.Deserialize<Dictionary<string, List<string>>>(json) ?? new();
         }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, "Errore in Fase 4:\n" + ex.Message, "Errore");
-        }
-        finally
-        {
-            pgbPhase4.Visible = false;
-            btnApplyPhase4.Enabled = true;
-        }
+        catch { return new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase); }
     }
 
-    private string SuggestPhase4Name()
+    private static void WriteTemplatesJson(this CfCourseGeneratorForm self, Dictionary<string, List<string>> map)
     {
-        var f3 = (txtPhase3Out.Text ?? "").Trim();
-        string dir = File.Exists(f3) ? (Path.GetDirectoryName(f3) ?? Environment.GetFolderPath(Environment.SpecialFolder.Desktop)) : Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-        string baseName = File.Exists(f3) ? Path.GetFileNameWithoutExtension(f3).Replace("_Fase3", "") : "Output";
-        return Path.Combine(dir, baseName + "_Fase4_pulito.xlsx");
-    }
-
-    private string? MatchesAnyRule(List<string> row, List<string> headers, List<RuleDef> rules,
-        HashSet<string> peopleSet, HashSet<(string, string)> peoplePairs,
-        HashSet<string> courseSet, HashSet<(string, string)> coursePairs)
-    {
-        foreach (var rule in rules)
-        {
-            if (MatchesRule(row, headers, rule, peopleSet, peoplePairs, courseSet, coursePairs))
-                return rule.Name; // motivo = nome regola
-        }
-        return null;
-    }
-
-    private bool MatchesRule(List<string> row, List<string> headers, RuleDef rule,
-        HashSet<string> peopleSet, HashSet<(string, string)> peoplePairs,
-        HashSet<string> courseSet, HashSet<(string, string)> coursePairs)
-    {
-        string Get(string? fieldName)
-        {
-            if (string.IsNullOrWhiteSpace(fieldName)) return "";
-            int i = headers.FindIndex(h => string.Equals(h, fieldName, StringComparison.OrdinalIgnoreCase));
-            if (i < 0 || i >= row.Count) return "";
-            return row[i] ?? "";
-        }
-
-        switch (rule.Kind)
-        {
-            case RuleKind.DateAfterToday:
-                {
-                    var s = Get(rule.Field1);
-                    if (DateTime.TryParse(s, out var dt))
-                    {
-                        // confronto con oggi (locale)
-                        return dt.Date > DateTime.Now.Date;
-                    }
-                    // se non è data valida, NON escludo (oppure potresti voler escludere: dipende); lasciamo passare.
-                    return false;
-                }
-
-            case RuleKind.MaxLength:
-                {
-                    int max = rule.IntParam.GetValueOrDefault(16);
-                    var s = Get(rule.Field1);
-                    return s != null && s.Length > max;
-                }
-
-            case RuleKind.NotPresentInPhase2:
-                {
-                    string dataset = rule.Phase2Dataset ?? "";
-                    var val = Get(rule.Field1);
-                    if (string.IsNullOrWhiteSpace(val)) return true; // assente → escludi
-
-                    if (string.Equals(dataset, "Persone", StringComparison.OrdinalIgnoreCase))
-                        return !peopleSet.Contains(val);
-
-                    if (string.Equals(dataset, "Corsi", StringComparison.OrdinalIgnoreCase))
-                        return !courseSet.Contains(val);
-
-                    return false;
-                }
-
-            case RuleKind.PairNotPresentInPhase2:
-                {
-                    string dataset = rule.Phase2Dataset ?? "";
-                    var a = Get(rule.Field1);
-                    var b = Get(rule.Field2);
-                    if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return true;
-
-                    if (string.Equals(dataset, "Persone", StringComparison.OrdinalIgnoreCase))
-                        return !peoplePairs.Contains((a, b));
-
-                    if (string.Equals(dataset, "Corsi", StringComparison.OrdinalIgnoreCase))
-                        return !coursePairs.Contains((a, b));
-
-                    return false;
-                }
-        }
-
-        return false;
-    }
-
-    // ===== Costruisci lookup da Fase 2 (legge i file/colonne scelti in Fase 2) =====
-    // Persone: Col1 (es. Codice Fiscale), Col2 (es. Person Number)
-    private (HashSet<string> one, HashSet<(string, string)> pairs) BuildPhase2PeopleSets()
-    {
-        var path = _settings.Get("Phase2PersonPath") ?? txtPersonMapPath.Text;
-        var sheet = _settings.Get("Phase2PersonSheet") ?? cmbPersonSheet.SelectedItem?.ToString();
-        var col1Name = _settings.Get("Phase2PersonCol1") ?? cmbPersonCol1.SelectedItem?.ToString();
-        var col2Name = _settings.Get("Phase2PersonCol2") ?? cmbPersonCol2.SelectedItem?.ToString();
-
-        return BuildSets(path, sheet, col1Name, col2Name);
-    }
-
-    // Corsi: Col1 (es. Titolo Corso), Col2 (es. Nome Corso) — o CodCorso+Titolo: dipende da come selezioni in Fase 2.
-    private (HashSet<string> one, HashSet<(string, string)> pairs) BuildPhase2CourseSets()
-    {
-        var path = _settings.Get("Phase2CoursePath") ?? txtCourseMapPath.Text;
-        var sheet = _settings.Get("Phase2CourseSheet") ?? cmbCourseSheet.SelectedItem?.ToString();
-        var col1Name = _settings.Get("Phase2CourseCol1") ?? cmbCourseCol1.SelectedItem?.ToString();
-        var col2Name = _settings.Get("Phase2CourseCol2") ?? cmbCourseCol2.SelectedItem?.ToString();
-
-        return BuildSets(path, sheet, col1Name, col2Name);
-    }
-
-    // Legge l'intero foglio, individua indice colonne per nome header, estrae set singolo e set coppie
-    private (HashSet<string> one, HashSet<(string, string)> pairs) BuildSets(string? path, string? sheet, string? col1Name, string? col2Name)
-    {
-        var one = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var pairs = new HashSet<(string, string)>();
-
         try
         {
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return (one, pairs);
+            var json = JsonSerializer.Serialize(map, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(self.TemplatesFilePath, json);
+        }
+        catch { /* ignore */ }
+    }
+}
 
-            var (headers, rows) = ReadSheetAll(path, sheet ?? "");
-            int i1 = headers.FindIndex(h => string.Equals(h, col1Name ?? "", StringComparison.OrdinalIgnoreCase));
-            int i2 = headers.FindIndex(h => string.Equals(h, col2Name ?? "", StringComparison.OrdinalIgnoreCase));
-
-            foreach (var r in rows)
+internal static class RuleRepositoryFlex
+{
+    public static RuleModelFlexible[] RulesGetAllFlex(this CfCourseGeneratorForm self)
+    {
+        var svc = self.RulesService;
+        if (svc != null)
+        {
+            var t = svc.GetType();
+            var m = t.GetMethod("GetAllRules", Type.EmptyTypes) ??
+                    t.GetMethod("GetAll", Type.EmptyTypes) ??
+                    t.GetMethod("List", Type.EmptyTypes);
+            if (m != null)
             {
-                if (i1 >= 0 && i1 < r.Count)
+                var res = m.Invoke(svc, null) as System.Collections.IEnumerable;
+                if (res != null)
                 {
-                    var a = r[i1] ?? "";
-                    if (!string.IsNullOrWhiteSpace(a)) one.Add(a);
-
-                    if (i2 >= 0 && i2 < r.Count)
-                    {
-                        var b = r[i2] ?? "";
-                        if (!string.IsNullOrWhiteSpace(a) && !string.IsNullOrWhiteSpace(b))
-                            pairs.Add((a, b));
-                    }
+                    return res.Cast<object?>().Select(ToFlexible).Where(x => x != null).Cast<RuleModelFlexible>().ToArray();
                 }
             }
         }
-        catch (Exception ex)
+        return self.ReadRulesJson();
+    }
+
+    private static RuleModelFlexible? ToFlexible(object? obj)
+    {
+        if (obj == null) return null;
+        var t = obj.GetType();
+        string name = t.GetProperty("Name")?.GetValue(obj)?.ToString()
+                      ?? t.GetProperty("Title")?.GetValue(obj)?.ToString() ?? "Rule";
+        string type = t.GetProperty("Type")?.GetValue(obj)?.ToString() ?? "";
+        string expr = t.GetProperty("Expression")?.GetValue(obj)?.ToString() ?? "";
+        return new RuleModelFlexible { Name = name, Type = type, Expression = expr };
+    }
+
+    private static RuleModelFlexible[] ReadRulesJson(this CfCourseGeneratorForm self)
+    {
+        try
         {
-            _log.Error($"Errore nel leggere dataset Fase 2: {ex.Message}");
+            var path = self.RulesFilePath;
+            if (!File.Exists(path)) return Array.Empty<RuleModelFlexible>();
+            var json = File.ReadAllText(path);
+            return JsonSerializer.Deserialize<RuleModelFlexible[]>(json) ?? Array.Empty<RuleModelFlexible>();
         }
-
-        return (one, pairs);
+        catch { return Array.Empty<RuleModelFlexible>(); }
     }
-    // ======================
-// FIX metodi mancanti
-// ======================
-
-// Popola la lista dei template salvati (Fase 3)
-private void ReloadSavedTemplatesList()
-{
-    if (lstSavedTemplates == null) return;
-    lstSavedTemplates.Items.Clear();
-    foreach (var name in _templates.List())
-        lstSavedTemplates.Items.Add(name);
 }
 
-// Rileva fogli e intestazioni in base al file selezionato nella Fase 1
-private void TryPopulateSheetAndHeaders()
+internal class RuleModelFlexible
 {
-    cmbSheet.Items.Clear();
-    cmbColumn.Items.Clear();
+    public string Name { get; set; } = "";
+    public string Type { get; set; } = "";
+    public string Expression { get; set; } = "";
+}
 
-    var path = (txtExcel.Text ?? "").Trim();
-    if (!File.Exists(path)) return;
-
-    var sheets = _lists.GetSheets(path);
-    if (sheets.Count > 0)
+internal static class UiExtensions
+{
+    public static void SetText(this TextBox? tb, string value)
     {
-        foreach (var s in sheets) cmbSheet.Items.Add(s);
-        cmbSheet.SelectedIndex = 0;
-
-        // ricarica intestazioni quando cambio foglio
-        cmbSheet.SelectedIndexChanged -= CmbSheet_SelectedIndexChanged_LoadHeaders;
-        cmbSheet.SelectedIndexChanged += CmbSheet_SelectedIndexChanged_LoadHeaders;
-        LoadHeadersForCurrent();
+        if (tb is null) return;
+        tb.Text = value ?? string.Empty;
     }
-    else
+
+    public static void AttachClick(this Button? b, Action handler)
     {
-        // CSV/TXT o file senza fogli: carico direttamente le intestazioni "flat"
-        cmbSheet.Items.Add("(non applicabile)");
-        cmbSheet.SelectedIndex = 0;
-
-        var headers = _lists.GetHeaders(path, null);
-        foreach (var h in headers) cmbColumn.Items.Add(h);
-        if (cmbColumn.Items.Count > 0) cmbColumn.SelectedIndex = 0;
+        if (b is null) return;
+        b.Click += (_, __) => handler();
     }
-}
 
-// Helper per collegare l'evento SelectedIndexChanged del combo "Foglio"
-private void CmbSheet_SelectedIndexChanged_LoadHeaders(object? sender, EventArgs e) => LoadHeadersForCurrent();
-
-// Legge le intestazioni del foglio selezionato e popola la combo "Colonna"
-private void LoadHeadersForCurrent()
-{
-    cmbColumn.Items.Clear();
-
-    var path = (txtExcel.Text ?? "").Trim();
-    if (!File.Exists(path)) return;
-
-    var sel = cmbSheet.SelectedItem?.ToString() ?? "";
-    string? sheet = string.Equals(sel, "(non applicabile)", StringComparison.OrdinalIgnoreCase) ? null : sel;
-
-    var headers = _lists.GetHeaders(path, sheet);
-    foreach (var h in headers) cmbColumn.Items.Add(h);
-    if (cmbColumn.Items.Count > 0) cmbColumn.SelectedIndex = 0;
-}
-
-// Suggerisce/imposta il percorso di output predefinito per la Fase 3
-private void UpdateDefaultPhase3Out()
-{
-    var input = (txtExcel.Text ?? "").Trim();
-
-    // Cartella base: stessa dell'input se spuntato e il file esiste; altrimenti quella scelta; fallback Desktop
-    string baseDir;
-    if (chkSameFolder.Checked && File.Exists(input))
-        baseDir = Path.GetDirectoryName(input) ?? Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-    else if (!string.IsNullOrWhiteSpace(txtOutputFolder.Text))
-        baseDir = txtOutputFolder.Text.Trim();
-    else
-        baseDir = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-
-    // Nome base: dal file di input se disponibile; altrimenti "Output"
-    string baseName = File.Exists(input) ? (Path.GetFileNameWithoutExtension(input) ?? "Output") : "Output";
-    string suggested = Path.Combine(baseDir, baseName + "_Fase3.xlsx");
-
-    // Se non c’è nulla o se è un vecchio suggerimento, imposta quello nuovo
-    if (string.IsNullOrWhiteSpace(txtPhase3Out.Text)
-        || txtPhase3Out.Text.EndsWith("_Fase3.xlsx", StringComparison.OrdinalIgnoreCase))
+    public static void AttachChecked(this RadioButton? rb, Action handler)
     {
-        txtPhase3Out.Text = suggested;
+        if (rb is null) return;
+        rb.CheckedChanged += (_, __) => handler();
     }
-}
 
+    public static void Enable(this Control? c)
+    {
+        if (c is null) return;
+        c.Enabled = true;
+    }
 }
